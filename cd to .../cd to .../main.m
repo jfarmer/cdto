@@ -172,8 +172,9 @@ BOOL isKittyConfigured(void) {
                                                    encoding:NSUTF8StringEncoding 
                                                       error:nil];
     
-    return ([content containsString:@"allow_remote_control=yes"] && 
-            [content containsString:@"--listen-on"]);
+    BOOL allowsRemoteControl = ([content containsString:@"allow_remote_control=yes"] ||
+                                [content containsString:@"allow_remote_control=socket-only"]);
+    return (allowsRemoteControl && [content containsString:@"--listen-on"]);
 }
 
 /**
@@ -185,7 +186,7 @@ void showKittySetupAlert(void) {
     [alert setInformativeText:
         @"To use cd to... with Kitty:\n\n"
         @"1. Create ~/.config/kitty/macos-launch-services-cmdline\n"
-        @"2. Add this line: --single-instance -o allow_remote_control=yes --listen-on unix:/tmp/cdto-kitty\n"
+        @"2. Add this line: --single-instance -o allow_remote_control=socket-only --listen-on unix:/tmp/cdto-kitty\n"
         @"3. Restart Kitty\n\n"
         @"Falling back to Terminal.app for now."];
     [alert addButtonWithTitle:@"OK"];
