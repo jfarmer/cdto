@@ -25,12 +25,12 @@ static NSString * const CDTCloseDefaultWindowKey = @"cdto-close-default-window";
 static NSString * const CDTKittySessionKey = @"cdto-kitty-session";
 
 // Kitty remote control settings
-static NSString * const CDTKittySocketPath = @"unix:/tmp/cdto-kitty";
-static NSTimeInterval const CDTKittyCommandTimeout = 10.0;
+static NSString * const CDTKittySocketPath = @"/tmp/cdto-kitty";
+static NSTimeInterval const CDTKittySocketWaitTimeout = 5.0;
+static NSTimeInterval const CDTKittySocketPollInterval = 0.05;
 static NSTimeInterval const CDTTerminalBusyWaitInterval = 0.1;
 
 // Terminal preference values
-static NSString * const CDTTerminalPreferenceTerminal = @"terminal";
 static NSString * const CDTTerminalPreferenceKitty = @"kitty";
 
 #pragma mark - Helper Functions
@@ -40,10 +40,6 @@ static NSString * const CDTTerminalPreferenceKitty = @"kitty";
  * Used for detecting automatically opened launch windows.
  */
 NSUInteger linesOfHistory(TerminalTab* tab) {
-    if (!tab) {
-        return 0;
-    }
-    
     NSString* hist = [[tab history] stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
     return [[hist componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] count];
 }
@@ -52,22 +48,14 @@ NSUInteger linesOfHistory(TerminalTab* tab) {
  * Resolves the target directory from Finder selection or active window.
  * Handles aliases and ensures we get a directory path.
  */
-NSURL * _Nullable resolveFinderTarget(FinderApplication *finder, BOOL *isSelected) {
-    if (!finder || !isSelected) {
-        return nil;
-    }
-    
+NSURL * _Nullable resolveFinderTarget(FinderApplication *finder) {
     FinderItem *target = [(NSArray*)[[finder selection] get] firstObject];
     FinderFinderWindow* findWin = [[finder FinderWindows] objectAtLocation:@1];
     findWin = [[finder FinderWindows] objectWithID:[NSNumber numberWithInteger: findWin.id]];
     
-    *isSelected = (target != nil);
+    BOOL isSelected = (target != nil);
     if (target == nil) {
         target = [[findWin target] get];
-    }
-    
-    if (!target) {
-        return nil;
     }
     
     // Handle aliases by getting the original item
@@ -83,7 +71,7 @@ NSURL * _Nullable resolveFinderTarget(FinderApplication *finder, BOOL *isSelecte
     }
     
     // For selected files, get the parent directory
-    if (![fileUrl hasSuffix:@"/"] && *isSelected) {
+    if (![fileUrl hasSuffix:@"/"] && isSelected) {
         fileUrl = [fileUrl stringByDeletingLastPathComponent];
     }
     
@@ -94,11 +82,6 @@ NSURL * _Nullable resolveFinderTarget(FinderApplication *finder, BOOL *isSelecte
  * Opens a directory in Terminal.app using the existing logic.
  */
 BOOL openDirectoryInTerminal(NSURL *url) {
-    if (!url) {
-        NSLog(@"Error: Cannot open nil URL in Terminal");
-        return NO;
-    }
-    
     TerminalApplication* terminal = [SBApplication applicationWithBundleIdentifier:CDTTerminalAppBundleIdentifier];
     if (!terminal) {
         NSLog(@"Error: Could not connect to Terminal.app");
@@ -113,7 +96,6 @@ BOOL openDirectoryInTerminal(NSURL *url) {
         existingWin = [[terminal windows] objectWithID: [NSNumber numberWithInteger:existingWin.id]];
     }
     
-    // Open the directory
     [terminal open:@[url]];
     
     //get front most and then reference by id
@@ -133,7 +115,6 @@ BOOL openDirectoryInTerminal(NSURL *url) {
         for (TerminalSettingsSet *set in [terminal settingsSets]) {
             if([[set name] isEqualToString:setName]){
                 chosenSet = set;
-                break;
             }
         }
         if (chosenSet) {
@@ -141,10 +122,10 @@ BOOL openDirectoryInTerminal(NSURL *url) {
         }
     }
     
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:CDTCloseDefaultWindowKey] && existingWin) { //close first launch window
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:CDTCloseDefaultWindowKey]) { //close first launch window
         if ([[existingWin tabs] count] == 1) {
             TerminalTab* existingTab = [[existingWin tabs] objectAtLocation:@1];
-            if (existingTab && ![existingTab busy]) {
+            if (![existingTab busy]) {
                 //if history has same number of lines as new window
                 // assume automatically opened new window, and close it
                 NSUInteger oldTabLines = linesOfHistory(existingTab);
@@ -181,15 +162,17 @@ BOOL isKittyConfigured(void) {
  * Shows setup instructions for Kitty configuration.
  */
 void showKittySetupAlert(void) {
+    [NSApplication sharedApplication];
     NSAlert* alert = [[NSAlert alloc] init];
     [alert setMessageText:@"Kitty Setup Required"];
-    [alert setInformativeText:
+    [alert setInformativeText:[NSString stringWithFormat:
         @"To use cd to... with Kitty:\n\n"
         @"1. Create ~/.config/kitty/macos-launch-services-cmdline\n"
-        @"2. Add this line: --single-instance -o allow_remote_control=socket-only --listen-on unix:/tmp/cdto-kitty\n"
+        @"2. Add this line: --single-instance -o allow_remote_control=socket-only --listen-on unix:%@\n"
         @"3. Restart Kitty\n\n"
-        @"Falling back to Terminal.app for now."];
+        @"Falling back to Terminal.app for now.", CDTKittySocketPath]];
     [alert addButtonWithTitle:@"OK"];
+    [NSApp activateIgnoringOtherApps:YES];
     [alert runModal];
 }
 
@@ -215,15 +198,10 @@ NSString * _Nullable getKittenExecutablePath(void) {
 /**
  * Executes a Kitty command via kitten @ and returns success status.
  */
-BOOL executeKittyCommand(NSString *command) {
-    if (!command || command.length == 0) {
-        NSLog(@"Error: Kitty command cannot be empty");
-        return NO;
-    }
-    
+BOOL executeKittyCommand(NSString *kittenPath, NSArray<NSString *> *arguments) {
     NSTask *task = [[NSTask alloc] init];
-    [task setLaunchPath:@"/usr/bin/env"];
-    [task setArguments:@[@"sh", @"-c", command]];
+    [task setLaunchPath:kittenPath];
+    [task setArguments:[@[@"@", @"--to", [@"unix:" stringByAppendingString:CDTKittySocketPath]] arrayByAddingObjectsFromArray:arguments]];
     
     // Capture error output for debugging
     NSPipe *errorPipe = [NSPipe pipe];
@@ -231,15 +209,13 @@ BOOL executeKittyCommand(NSString *command) {
     
     @try {
         [task launch];
+        // Read stderr before waiting: kitten blocks if it fills the pipe buffer.
+        NSData *errorData = [[errorPipe fileHandleForReading] readDataToEndOfFile];
         [task waitUntilExit];
         
         if ([task terminationStatus] != 0) {
-            NSData *errorData = [[errorPipe fileHandleForReading] readDataToEndOfFile];
             NSString *errorString = [[NSString alloc] initWithData:errorData encoding:NSUTF8StringEncoding];
             NSLog(@"Kitty command failed with status %d: %@", [task terminationStatus], errorString);
-            NSDictionary *environment = [[NSProcessInfo processInfo] environment];
-            NSString *pathVariable = [environment objectForKey:@"PATH"];
-            NSLog(@"PATH environment variable: %@", pathVariable ?: @"(not set)");
             return NO;
         }
         
@@ -254,70 +230,47 @@ BOOL executeKittyCommand(NSString *command) {
  * Opens a directory in Kitty using remote control commands.
  */
 BOOL openDirectoryInKitty(NSURL *url) {
-    if (!url) {
-        NSLog(@"Error: Cannot open nil URL in Kitty");
-        return NO;
-    }
-    
-    // Check if Kitty is configured properly
     if (!isKittyConfigured()) {
         NSLog(@"Kitty is not configured for remote control");
         showKittySetupAlert();
         return NO;
     }
     
-    // Launch Kitty if not running
-    if (![[NSWorkspace sharedWorkspace] launchApplication:@"kitty"]) {
-        // Print PATH environment variable for debugging launch failures
-        NSDictionary *environment = [[NSProcessInfo processInfo] environment];
-        NSString *pathVariable = [environment objectForKey:@"PATH"];
-        NSLog(@"Failed to launch Kitty. PATH environment variable: %@", pathVariable ?: @"(not set)");
-        return NO;
-    }
-    
-    // Give Kitty time to start and create the socket
-    [NSThread sleepForTimeInterval:0.5];
-    
-    // Get kitten executable path
     NSString *kittenPath = getKittenExecutablePath();
     if (!kittenPath) {
-        NSLog(@"Error: Could not find kitten executable");
         return NO;
     }
     
-    // Open directory in new tab
-    NSString *command = [NSString stringWithFormat:
-        @"%@ @ --to %@ launch --type=tab --cwd=\"%@\"", 
-        kittenPath, CDTKittySocketPath, [url path]];
-    
-    if (!executeKittyCommand(command)) {
-        NSLog(@"Failed to open directory in Kitty");
+    // launchApplication: also activates Kitty when it is already running,
+    // so call it either way and only wait for the socket on a cold start.
+    BOOL kittyWasRunning = [[NSRunningApplication runningApplicationsWithBundleIdentifier:CDTKittyBundleIdentifier] count] > 0;
+    if (![[NSWorkspace sharedWorkspace] launchApplication:@"kitty"]) {
+        NSLog(@"Failed to launch Kitty");
         return NO;
     }
     
-    // Apply session configuration if set
+    // A Kitty that was already running either has the socket or will not
+    // create it until it is restarted, so only a new Kitty is waited for.
+    if (!kittyWasRunning) {
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:CDTKittySocketWaitTimeout];
+        while (![[NSFileManager defaultManager] fileExistsAtPath:CDTKittySocketPath] && [deadline timeIntervalSinceNow] > 0) {
+            [NSThread sleepForTimeInterval:CDTKittySocketPollInterval];
+        }
+    }
+    
+    NSString *cwdArgument = [@"--cwd=" stringByAppendingString:[url path]];
+    if (!executeKittyCommand(kittenPath, @[@"launch", @"--type=tab", cwdArgument])) {
+        return NO;
+    }
+    
     NSString *sessionName = [[NSUserDefaults standardUserDefaults] stringForKey:CDTKittySessionKey];
-    if (sessionName && sessionName.length > 0) {
+    if (sessionName.length > 0) {
         NSString *sessionPath = [NSString stringWithFormat:@"~/.config/kitty/sessions/%@.conf", sessionName];
         sessionPath = [sessionPath stringByExpandingTildeInPath];
         
         if ([[NSFileManager defaultManager] fileExistsAtPath:sessionPath]) {
-            NSString *kittenPath = getKittenExecutablePath();
-            if (kittenPath) {
-                NSString *sessionCommand = [NSString stringWithFormat:
-                    @"%@ @ --to %@ launch --session \"%@\"", 
-                    kittenPath, CDTKittySocketPath, sessionPath];
-                executeKittyCommand(sessionCommand); // Non-fatal if this fails
-            }
+            executeKittyCommand(kittenPath, @[@"launch", @"--session", sessionPath]); // Non-fatal if this fails
         }
-    }
-    
-    // Handle auto-close feature (simplified for Kitty)
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:CDTCloseDefaultWindowKey]) {
-        // For Kitty, we could implement this by querying window state via 'kitten @ ls'
-        // and closing windows that match certain criteria, but this is complex.
-        // For now, we'll skip this feature for Kitty to maintain simplicity.
-        NSLog(@"Note: Auto-close feature not yet implemented for Kitty");
     }
     
     return YES;
@@ -334,31 +287,22 @@ int main(int argc, const char * argv[]) {
             return 1;
         }
         
-        // Resolve the target directory from Finder
-        BOOL isSelected;
-        NSURL *targetURL = resolveFinderTarget(finder, &isSelected);
+        NSURL *targetURL = resolveFinderTarget(finder);
         if (!targetURL) {
             NSLog(@"Error: Could not determine target directory from Finder");
             return 1;
         }
         
-        // Determine preferred terminal
-        NSString *preferredTerminal = [[NSUserDefaults standardUserDefaults] 
-            stringForKey:CDTPreferredTerminalKey] ?: CDTTerminalPreferenceTerminal;
+        NSString *preferredTerminal = [[NSUserDefaults standardUserDefaults] stringForKey:CDTPreferredTerminalKey];
         
         BOOL success = NO;
-        
-        // Try preferred terminal first
         if ([preferredTerminal isEqualToString:CDTTerminalPreferenceKitty]) {
             success = openDirectoryInKitty(targetURL);
-            
-            // Fall back to Terminal.app if Kitty fails
             if (!success) {
                 NSLog(@"Falling back to Terminal.app");
-                success = openDirectoryInTerminal(targetURL);
             }
-        } else {
-            // Use Terminal.app (default)
+        }
+        if (!success) {
             success = openDirectoryInTerminal(targetURL);
         }
         
